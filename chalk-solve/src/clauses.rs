@@ -2,6 +2,7 @@ use self::builder::ClauseBuilder;
 use self::env_elaborator::elaborate_env_clauses;
 use self::program_clauses::ToProgramClauses;
 use crate::goal_builder::GoalBuilder;
+use crate::rust_ir::WellKnownTrait;
 use crate::split::Split;
 use crate::RustIrDatabase;
 use chalk_ir::cast::{Cast, Caster};
@@ -551,7 +552,14 @@ fn program_clauses_that_could_match<I: Interner>(
         | DomainGoal::IsUpstream(ty)
         | DomainGoal::DownstreamType(ty)
         | DomainGoal::IsFullyVisible(ty)
-        | DomainGoal::IsLocal(ty) => match_ty(builder, environment, ty)?,
+        | DomainGoal::IsLocal(ty) => {
+            let variable_kinds = VariableKinds::from_iter(
+                interner,
+                binders.as_slice(interner).iter().map(|cv| cv.kind.clone()),
+            );
+            let bound_ty = Binders::new(variable_kinds, ty.clone());
+            builder.push_binders(&bound_ty, |builder, ty| match_ty(builder, environment, &ty))?;
+        }
         DomainGoal::FromEnv(_) => (), // Computed in the environment
         DomainGoal::Normalize(Normalize { alias, ty: _ }) => match alias {
             AliasTy::Projection(proj) => {
@@ -839,18 +847,72 @@ fn match_ty<I: Interner>(
             .db
             .fn_def_datum(*fn_def_id)
             .to_program_clauses(builder, environment),
-        TyKind::Tuple(_, _)
+        TyKind::Tuple(0, _)
         | TyKind::Scalar(_)
         | TyKind::Str
-        | TyKind::Slice(_)
         | TyKind::Raw(_, _)
-        | TyKind::Ref(_, _, _)
-        | TyKind::Array(_, _)
         | TyKind::Never
         | TyKind::Closure(_, _)
         | TyKind::Foreign(_)
         | TyKind::Generator(_, _)
         | TyKind::GeneratorWitness(_, _) => builder.push_fact(WellFormed::Ty(ty.clone())),
+        TyKind::Tuple(len, substs) => {
+            // WF((T0, ..., Tn, U)) :- T0: Sized, ... Tn: Sized
+            let tuple_ty = TyKind::Tuple(*len, substs.clone()).intern(interner);
+            let sized = builder.db.well_known_trait_id(WellKnownTrait::Sized);
+            builder.push_clause(
+                WellFormed::Ty(tuple_ty),
+                substs.as_slice(interner)[..*len - 1]
+                    .iter()
+                    .filter_map(|s| {
+                        let ty_var = s.assert_ty_ref(interner).clone();
+                        sized.map(|id| {
+                            WhereClause::Implemented(TraitRef {
+                                trait_id: id,
+                                substitution: Substitution::from1(interner, ty_var),
+                            })
+                        })
+                    }),
+            );
+        }
+        TyKind::Ref(m, lt, ty) => {
+            // WF(&'a T) :- T: 'a
+            let ref_ty = TyKind::Ref(*m, lt.clone(), ty.clone()).intern(interner);
+            builder.push_clause(
+                WellFormed::Ty(ref_ty),
+                Some(WhereClause::TypeOutlives(TypeOutlives {
+                    ty: ty.clone(),
+                    lifetime: lt.clone(),
+                })),
+            );
+        }
+        TyKind::Slice(elem_ty) => {
+            // WF([T]) :- T: Sized
+            let sized = builder.db.well_known_trait_id(WellKnownTrait::Sized);
+            builder.push_clause(
+                WellFormed::Ty(TyKind::Slice(elem_ty.clone()).intern(interner)),
+                sized.map(|id| {
+                    WhereClause::Implemented(TraitRef {
+                        trait_id: id,
+                        substitution: Substitution::from1(interner, elem_ty.clone()),
+                    })
+                }),
+            );
+        }
+        TyKind::Array(elem_ty, size) => {
+            // WF([T, N]) :- T: Sized
+            let array_ty = TyKind::Array(elem_ty.clone(), size.clone()).intern(interner);
+            let sized = builder.db.well_known_trait_id(WellKnownTrait::Sized);
+            builder.push_clause(
+                WellFormed::Ty(array_ty),
+                sized.map(|id| {
+                    WhereClause::Implemented(TraitRef {
+                        trait_id: id,
+                        substitution: Substitution::from1(interner, elem_ty.clone()),
+                    })
+                }),
+            );
+        }
         TyKind::Placeholder(_) => {
             builder.push_clause(WellFormed::Ty(ty.clone()), Some(FromEnv::Ty(ty.clone())));
         }
